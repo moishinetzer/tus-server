@@ -108,19 +108,48 @@ router
 
     .all('*', () => error(404));
 
+const CORS_HEADERS = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, PATCH, HEAD, OPTIONS, DELETE',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, Upload-Length, Upload-Offset, Tus-Resumable, Upload-Metadata, Upload-Defer-Length, X-Signal-Checksum-Sha256',
+    'Access-Control-Expose-Headers': 'Upload-Offset, Upload-Length, Tus-Version, Tus-Resumable, Tus-Max-Size, Tus-Extension, Upload-Metadata, Upload-Expires, Location, X-Signal-Checksum-Sha256',
+};
+
+function addCorsHeaders(response: Response): Response {
+    const newHeaders = new Headers(response.headers);
+    for (const [key, value] of Object.entries(CORS_HEADERS)) {
+        newHeaders.set(key, value);
+    }
+    return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: newHeaders,
+    });
+}
+
 export default {
     async fetch(
         request: Request,
         env: Env,
         ctx: ExecutionContext
     ): Promise<Response> {
-        return router.fetch(request, env, ctx).catch(e => {
+        // Handle CORS preflight
+        if (request.method === 'OPTIONS') {
+            return new Response(null, {
+                status: 204,
+                headers: CORS_HEADERS,
+            });
+        }
+
+        const response = await router.fetch(request, env, ctx).catch(e => {
             console.log(`error processing ${request.method}:${request.url}: ${e.stack}`);
             if (e instanceof StatusError) {
                 return error(e);
             }
             throw e;
         }).then(json);
+
+        return addCorsHeaders(response);
     }
 };
 

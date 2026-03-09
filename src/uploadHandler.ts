@@ -19,16 +19,19 @@ import {R2UploadedPart} from '@cloudflare/workers-types';
 export const TUS_VERSION = '1.0.0';
 
 // uploads larger than this will be rejected
-export const MAX_UPLOAD_LENGTH_BYTES = 1024 * 1024 * 100;
+export const MAX_UPLOAD_LENGTH_BYTES = 1024 * 1024 * 1024 * 50; // 50GB
 
 export const X_SIGNAL_CHECKSUM_SHA256 = 'X-Signal-Checksum-Sha256';
 
 // how long an unfinished upload lives in ms
 const UPLOAD_EXPIRATION_MS = 7 * 24 * 60 * 60 * 1000;
 
-// how much we'll buffer in memory, must be greater than or equal to R2's min part size
+// how much we'll buffer in memory, must be greater than or equal to R2's min part size (5MB)
 // https://developers.cloudflare.com/r2/objects/multipart-objects/#limitations
 const BUFFER_SIZE = 1024 * 1024 * 5;
+
+// Maximum number of concurrent R2 part uploads
+const MAX_CONCURRENT_UPLOADS = 6;
 
 // how much of the upload we've written
 const UPLOAD_OFFSET_KEY = 'upload-offset';
@@ -236,9 +239,13 @@ export class UploadHandler {
 
     // append to the upload at the current upload offset
     async patch(request: IRequest): Promise<Response> {
+        const patchStart = Date.now();
         const r2Key = request.params.id!;
+        console.log(`[TIMING] PATCH START for ${r2Key}`);
 
+        const getOffsetStart = Date.now();
         let uploadOffset: number | undefined = await this.state.storage.get(UPLOAD_OFFSET_KEY);
+        console.log(`[TIMING] storage.get(offset) took ${Date.now() - getOffsetStart}ms`);
         if (uploadOffset == null) {
             return error(404);
         }
@@ -248,7 +255,9 @@ export class UploadHandler {
             return error(409, 'incorrect upload offset');
         }
 
+        const getInfoStart = Date.now();
         const uploadInfo: StoredUploadInfo | undefined = await this.state.storage.get(UPLOAD_INFO_KEY);
+        console.log(`[TIMING] storage.get(info) took ${Date.now() - getInfoStart}ms`);
         if (uploadInfo == null) {
             throw new UnrecoverableError('existing upload should have had uploadInfo', r2Key);
         }
@@ -269,10 +278,15 @@ export class UploadHandler {
 
         uploadOffset = await this.appendBody(r2Key, request.body, uploadOffset, uploadInfo);
 
+        const expirationStart = Date.now();
+        const expiration = await this.expirationTime();
+        console.log(`[TIMING] expirationTime took ${Date.now() - expirationStart}ms`);
+
+        console.log(`[TIMING] PATCH DONE for ${r2Key}: total=${Date.now() - patchStart}ms`);
         return new Response(null, {
             status: 204, headers: new Headers({
                 'Upload-Offset': uploadOffset.toString(),
-                'Upload-Expires': (await this.expirationTime()).toString(),
+                'Upload-Expires': expiration.toString(),
                 'Tus-Resumable': TUS_VERSION
             })
         });
@@ -280,25 +294,11 @@ export class UploadHandler {
 
 
     // Append body to the upload starting at uploadOffset. Returns the new uploadOffset
-    //
-    // The body is streamed into a fixed length buffer. If the object fits into a single
-    // buffer, it's uploaded directly. Otherwise, each full buffer is uploaded to a
-    // multipart transaction.
-    //
-    // If the stream ends but we have not hit uploadLength (either due to an error or a
-    // partial upload), the remaining buffer is written to a temporary object. When
-    // the upload is resumed, we retrieve the temporary and repopulate the buffer.
-    //
-    // If the client provides a checksum we need to do two things:
-    // A. Reject the upload if it doesn't match the provided checksum
-    // B. Once the object is uploaded, return the checksum on subsequent GET/HEAD requests
-    //
-    // Depending on how the object is uploaded, we achieve A and B different ways. If the object can be uploaded without
-    // using mulitpart upload, R2 provides support for A and B directly. Otherwise, we support B by
-    // adding custom metadata to the object when we create the multipart upload. For A, if the client manages to upload
-    // the object in one-shot we calculate the digest as it comes in. Otherwise, after the multipart upload is
-    // finished, we retrieve the object from R2 and recompute the digest.
+    // Uses parallel uploads: up to MAX_CONCURRENT_UPLOADS R2 uploads in flight simultaneously
     async appendBody(r2Key: string, body: ReadableStream<Uint8Array>, uploadOffset: number, uploadInfo: StoredUploadInfo): Promise<number> {
+        const appendStart = Date.now();
+        console.log(`[TIMING] appendBody START for ${r2Key}, offset=${uploadOffset}`);
+
         const uploadLength = uploadInfo.uploadLength;
         if ((uploadLength || 0) > MAX_UPLOAD_LENGTH_BYTES) {
             await this.cleanup(r2Key);
@@ -308,20 +308,52 @@ export class UploadHandler {
         // We'll repeatedly use this to buffer data we'll send to R2
         const mem = new WritableStreamBuffer(new ArrayBuffer(BUFFER_SIZE));
 
+        const resumeStart = Date.now();
         uploadOffset = await this.resumeUpload(r2Key, uploadOffset, uploadInfo, mem);
+        console.log(`[TIMING] resumeUpload took ${Date.now() - resumeStart}ms, newOffset=${uploadOffset}`);
 
         const isSinglePart = uploadLength != null && uploadLength <= BUFFER_SIZE;
         const checksum: Uint8Array | undefined = uploadInfo.checksum;
-        // optimization: only bother calculating the stream’s checksum if the client provided it, and we’re not resuming
         const digester: Digester = checksum != null && uploadOffset == 0 && !isSinglePart ? sha256Digester() : noopDigester();
 
+        let partCount = 0;
+
+        // Track pending R2 uploads - up to MAX_CONCURRENT_UPLOADS in flight
+        type PendingUpload = {promise: Promise<R2UploadedPart>, length: number, partNum: number};
+        const pendingUploads: PendingUpload[] = [];
+
+        // Helper to flush completed uploads and store their results
+        const flushCompleted = async () => {
+            const flushStart = Date.now();
+            const count = pendingUploads.length;
+            // Wait for all pending uploads to complete
+            const results = await Promise.all(pendingUploads.map(p => p.promise));
+            const r2Time = Date.now() - flushStart;
+            for (let i = 0; i < results.length; i++) {
+                this.parts.push({part: results[i], length: pendingUploads[i].length});
+            }
+            // Batch write all parts to storage
+            const storageOps = pendingUploads.map((p, i) =>
+                this.state.storage.put(p.partNum.toString(), {part: results[i], length: p.length})
+            );
+            await Promise.all(storageOps);
+            const totalTime = Date.now() - flushStart;
+            console.log(`[TIMING] flush ${count} uploads: r2=${r2Time}ms, storage=${totalTime - r2Time}ms, total=${totalTime}ms`);
+            pendingUploads.length = 0;
+        };
+
+        const loopStart = Date.now();
         for await (const part of generateParts(body, mem)) {
+            partCount++;
+
             const newLength = uploadOffset + part.bytes.byteLength;
             if (uploadLength != null && newLength > uploadLength) {
+                await flushCompleted();
                 await this.cleanup(r2Key);
                 throw new StatusError(413, 'body exceeds Upload-Length');
             }
             if (newLength > MAX_UPLOAD_LENGTH_BYTES) {
+                await flushCompleted();
                 await this.cleanup(r2Key);
                 throw new StatusError(413, 'body exceeds maximum upload size');
             }
@@ -331,38 +363,78 @@ export class UploadHandler {
             switch (part.kind) {
                 case 'intermediate': {
                     if (this.multipart == null) {
+                        await flushCompleted();
+                        const createStart = Date.now();
                         this.multipart = await this.r2CreateMultipartUpload(r2Key, uploadInfo);
+                        console.log(`[TIMING] r2CreateMultipartUpload took ${Date.now() - createStart}ms`);
                     }
-                    this.parts.push({
-                        part: await this.r2UploadPart(r2Key, this.parts.length + 1, part.bytes),
-                        length: part.bytes.byteLength
+
+                    // If at max concurrent uploads, wait for all to complete
+                    if (pendingUploads.length >= MAX_CONCURRENT_UPLOADS) {
+                        console.log(`[TIMING] flushing ${pendingUploads.length} pending uploads`);
+                        await flushCompleted();
+                    }
+
+                    // Copy bytes since buffer will be reused
+                    const bytesCopy = new Uint8Array(part.bytes);
+                    const partNum = this.parts.length + pendingUploads.length + 1;
+
+                    // Start upload without awaiting
+                    pendingUploads.push({
+                        promise: this.r2UploadPart(r2Key, partNum, bytesCopy),
+                        length: bytesCopy.byteLength,
+                        partNum
                     });
+
                     uploadOffset += part.bytes.byteLength;
-                    const writePart = this.state.storage.put(this.parts.length.toString(), this.parts.at(-1));
-                    const writeOffset = this.state.storage.put(UPLOAD_OFFSET_KEY, uploadOffset);
-                    await Promise.all([writePart, writeOffset]);
+                    console.log(`[TIMING] part ${partCount} queued (intermediate, ${part.bytes.byteLength}b), pending=${pendingUploads.length}`);
                     break;
                 }
                 case 'final':
                 case 'error': {
+                    // Must await all pending uploads before handling final
+                    if (pendingUploads.length > 0) {
+                        console.log(`[TIMING] flushing ${pendingUploads.length} pending uploads before final`);
+                        await flushCompleted();
+                    }
+
                     const finished = uploadLength != null && uploadOffset + part.bytes.byteLength === uploadLength;
-                    if (!finished) {
-                        // write the partial part to a temporary object so we can rehydrate it
-                        // later, and then we're done
+                    const isFullPart = part.bytes.byteLength === mem.buf.byteLength;
+                    console.log(`[TIMING] part ${partCount} (${part.kind}, ${part.bytes.byteLength}b): finished=${finished}, isFullPart=${isFullPart}, hasMultipart=${!!this.multipart}`);
+
+                    if (!finished && this.multipart && isFullPart) {
+                        const r2Start = Date.now();
+                        this.parts.push({
+                            part: await this.r2UploadPart(r2Key, this.parts.length + 1, part.bytes),
+                            length: part.bytes.byteLength
+                        });
+                        uploadOffset += part.bytes.byteLength;
+                        const writePart = this.state.storage.put(this.parts.length.toString(), this.parts.at(-1));
+                        const writeOffset = this.state.storage.put(UPLOAD_OFFSET_KEY, uploadOffset);
+                        await Promise.all([writePart, writeOffset]);
+                        console.log(`[TIMING] final fullPart: r2=${Date.now() - r2Start}ms`);
+                    } else if (!finished) {
+                        const r2Start = Date.now();
                         await this.r2Put(this.tempkey(), part.bytes);
                         uploadOffset += part.bytes.byteLength;
                         await this.state.storage.put(UPLOAD_OFFSET_KEY, uploadOffset);
+                        console.log(`[TIMING] final temp write: r2=${Date.now() - r2Start}ms`);
                     } else if (!this.multipart) {
-                        // all the bytes fit into a single in memory buffer, so we can just upload
-                        // it directly without using multipart
+                        const r2Start = Date.now();
                         await this.r2Put(r2Key, part.bytes, checksum);
+                        console.log(`[TIMING] single-part r2Put took ${Date.now() - r2Start}ms`);
                         uploadOffset += part.bytes.byteLength;
                         await this.cleanup();
                     } else {
-                        // upload the last part (can be less than the 5mb min part size), then complete the upload
+                        const r2Start = Date.now();
                         const uploadedPart = await this.r2UploadPart(r2Key, this.parts.length + 1, part.bytes);
                         this.parts.push({part: uploadedPart, length: part.bytes.byteLength});
+                        console.log(`[TIMING] final r2UploadPart took ${Date.now() - r2Start}ms`);
+
+                        const completeStart = Date.now();
                         await this.r2CompleteMultipartUpload(r2Key, await digester.digest(), checksum);
+                        console.log(`[TIMING] r2CompleteMultipartUpload took ${Date.now() - completeStart}ms`);
+
                         uploadOffset += part.bytes.byteLength;
                         await this.cleanup();
                     }
@@ -370,6 +442,10 @@ export class UploadHandler {
                 }
             }
         }
+
+        // Final offset update
+        await this.state.storage.put(UPLOAD_OFFSET_KEY, uploadOffset);
+        console.log(`[TIMING] appendBody DONE: total=${Date.now() - appendStart}ms, loop=${Date.now() - loopStart}ms, parts=${partCount}`);
         return uploadOffset;
     }
 
@@ -444,12 +520,18 @@ export class UploadHandler {
                 .reduce((a, b) => a + b, 0);
         }
 
+        // Batch read all stored parts using list() instead of sequential get() calls
+        // This is much faster for uploads with many parts (e.g., 100MB chunks = 20 parts)
+        const allEntries = await this.state.storage.list<StoredR2Part>();
+
+        // Filter to only numeric keys (part numbers) and sort by part number
+        // Non-part keys like 'upload-offset' and 'upload-info' are excluded
+        const partEntries = [...allEntries.entries()]
+            .filter(([key]) => /^\d+$/.test(key))
+            .sort(([a], [b]) => parseInt(a) - parseInt(b));
+
         let partOffset = 0;
-        for (; ;) {
-            const part: StoredR2Part | undefined = await this.state.storage.get((this.parts.length + 1).toString());
-            if (part == null) {
-                break;
-            }
+        for (const [, part] of partEntries) {
             partOffset += part.length;
             if (partOffset > uploadOffset) {
                 // this part is past where we've told the client to start uploading
